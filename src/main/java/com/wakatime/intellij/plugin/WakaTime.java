@@ -9,17 +9,21 @@ Website:     https://wakatime.com/
 package com.wakatime.intellij.plugin;
 
 import com.intellij.AppTopics;
-//import com.intellij.compiler.server.BuildManagerListener;
 import com.intellij.ide.BrowserUtil;
 import com.intellij.ide.DataManager;
 import com.intellij.ide.plugins.PluginManager;
 import com.intellij.ide.plugins.PluginManagerCore;
+import com.intellij.execution.ExecutionManager;
+import com.intellij.execution.configurations.RunProfile;
+import com.intellij.execution.executors.DefaultDebugExecutor;
+import com.intellij.execution.runners.ExecutionEnvironment;
+import com.intellij.execution.testframework.TestConsoleProperties;
+import com.intellij.execution.testframework.actions.ConsolePropertiesProvider;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.actionSystem.CommonDataKeys;
 import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationInfo;
 import com.intellij.openapi.application.ApplicationManager;
-//import com.intellij.openapi.compiler.CompilerTopics;
 import com.intellij.openapi.application.ApplicationNamesInfo;
 import com.intellij.openapi.components.ApplicationComponent;
 import com.intellij.openapi.diagnostic.Logger;
@@ -30,12 +34,16 @@ import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileTypes.FileType;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.project.ProjectManager;
+import com.intellij.openapi.project.ProjectManagerListener;
 import com.intellij.openapi.ui.Messages;
+import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.util.io.FileUtil;
+import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.openapi.wm.StatusBar;
 import com.intellij.openapi.wm.WindowManager;
+import com.intellij.task.ProjectTaskListener;
 import com.intellij.util.concurrency.AppExecutorUtil;
 import com.intellij.util.messages.MessageBusConnection;
 import com.intellij.util.net.HttpConfigurable;
@@ -54,6 +62,16 @@ import java.util.concurrent.*;
 public class WakaTime implements ApplicationComponent {
 
     public static final BigDecimal FREQUENCY = new BigDecimal(2 * 60); // max secs between heartbeats for continuous coding
+    private static final int AI_ACTIVITY_TIMEOUT_SECONDS = 30;
+    private static final long AI_HUMAN_TYPING_GRACE_PERIOD_MILLIS = 10000;
+    private static final int AI_MIN_CHANGED_CHARS = 80;
+    private static final int AI_MIN_INSERTED_CHARS = 20;
+    private static final int AI_MIN_INSERTED_LINES = 3;
+    private static final String AI_ACTIVITY_PREFIX = "ai:";
+    public static final String CATEGORY_BUILDING = "building";
+    public static final String CATEGORY_AI_CODING = "ai coding";
+    public static final String CATEGORY_DEBUGGING = "debugging";
+    public static final String CATEGORY_RUNNING_TESTS = "running tests";
     public static final Logger log = Logger.getInstance("WakaTime");
 
     public static String VERSION;
@@ -65,18 +83,39 @@ public class WakaTime implements ApplicationComponent {
     public static Boolean DEBUG_CHECKED = false;
     public static Boolean STATUS_BAR = false;
     public static Boolean READY = false;
+    public static Boolean TRACK_BUILDING = false;
+    public static Boolean TRACK_AI_CODING = false;
+    public static Boolean TRACK_DEBUGGING = false;
+    public static Boolean TRACK_RUNNING_TESTS = false;
     public static String lastFile = null;
     public static BigDecimal lastTime = new BigDecimal(0);
-    public static Boolean isBuilding = false;
     public static Map<String, LineStats> lineStatsCache = new HashMap<String, LineStats>();
     public static Map<String, Integer> humanLineChanges = new HashMap<String, Integer>();
     public static Map<String, Boolean> filesWithHumanTyping = new HashMap<String, Boolean>();
+    public static Map<String, Long> lastHumanTypingAt = new HashMap<String, Long>();
     public static Boolean cancelApiKey = false;
 
     private final int queueTimeoutSeconds = 30;
     private static ConcurrentLinkedQueue<Heartbeat> heartbeatsQueue = new ConcurrentLinkedQueue<Heartbeat>();
     private static ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private static ScheduledFuture<?> scheduledFixture;
+    private static ScheduledFuture<?> scheduledActivityHeartbeat;
+    private static ConcurrentHashMap<String, String> activeActivityCategories = new ConcurrentHashMap<String, String>();
+    private static ConcurrentHashMap<String, Project> activeActivityProjects = new ConcurrentHashMap<String, Project>();
+    private static ConcurrentHashMap<String, Boolean> projectTaskSubscriptions = new ConcurrentHashMap<String, Boolean>();
+    private static ConcurrentHashMap<String, ScheduledFuture<?>> scheduledActivityStops = new ConcurrentHashMap<String, ScheduledFuture<?>>();
+
+    private static class ActivityHeartbeatData {
+        final VirtualFile file;
+        final Project project;
+        final LineStats lineStats;
+
+        ActivityHeartbeatData(@NotNull VirtualFile file, @NotNull Project project, @Nullable LineStats lineStats) {
+            this.file = file;
+            this.project = project;
+            this.lineStats = lineStats;
+        }
+    }
 
     public WakaTime() {
     }
@@ -138,7 +177,7 @@ public class WakaTime implements ApplicationComponent {
         ApplicationManager.getApplication().invokeLater(new Runnable(){
             public void run() {
                 Disposable disposable = Disposer.newDisposable("WakaTimeListener");
-                MessageBusConnection connection = ApplicationManager.getApplication().getMessageBus().connect();
+                connection = ApplicationManager.getApplication().getMessageBus().connect();
 
                 // save file
                 connection.subscribe(AppTopics.FILE_DOCUMENT_SYNC, new CustomSaveListener());
@@ -155,9 +194,13 @@ public class WakaTime implements ApplicationComponent {
                 // caret moved
                 EditorFactory.getInstance().getEventMulticaster().addCaretListener(new CustomCaretListener(), disposable);
 
-                // compiling
-                // connection.subscribe(BuildManagerListener.TOPIC, new CustomBuildManagerListener());
-                // connection.subscribe(CompilerTopics.COMPILATION_STATUS, new CustomBuildManagerListener());
+                // execution lifecycle
+                connection.subscribe(ExecutionManager.EXECUTION_TOPIC, new CustomExecutionListener());
+                connection.subscribe(ProjectManager.TOPIC, new CustomProjectManagerListener());
+
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    subscribeProjectListeners(project);
+                }
             }
         });
     }
@@ -185,10 +228,13 @@ public class WakaTime implements ApplicationComponent {
 
     public void disposeComponent() {
         try {
-            connection.disconnect();
+            if (connection != null) connection.disconnect();
         } catch(Exception e) { }
         try {
             scheduledFixture.cancel(true);
+        } catch (Exception e) { }
+        try {
+            if (scheduledActivityHeartbeat != null) scheduledActivityHeartbeat.cancel(true);
         } catch (Exception e) { }
 
         // make sure to send all heartbeats before exiting
@@ -223,6 +269,10 @@ public class WakaTime implements ApplicationComponent {
     }
 
     public static void appendHeartbeat(final VirtualFile file, final Project project, final boolean isWrite, @Nullable final LineStats lineStats) {
+        appendHeartbeat(file, project, isWrite, lineStats, false);
+    }
+
+    public static void appendHeartbeat(final VirtualFile file, final Project project, final boolean isWrite, @Nullable final LineStats lineStats, final boolean force) {
         checkDebug();
 
         if (!shouldLogFile(file)) return;
@@ -242,7 +292,7 @@ public class WakaTime implements ApplicationComponent {
         }
 
         final BigDecimal time = WakaTime.getCurrentTimestamp();
-        if (!isWrite && filePath.equals(WakaTime.lastFile) && !enoughTimePassed(time)) {
+        if (!force && !isWrite && filePath.equals(WakaTime.lastFile) && !enoughTimePassed(time)) {
             return;
         }
 
@@ -276,7 +326,7 @@ public class WakaTime implements ApplicationComponent {
                 h.isUnsavedFile = !file.exists();
                 h.project = projectName;
                 h.language = language;
-                h.isBuilding = WakaTime.isBuilding;
+                h.category = WakaTime.getCurrentActivityCategory();
                 if (lineStats != null) {
                     h.lineCount = lineStats.lineCount;
                     h.lineNumber = lineStats.lineNumber;
@@ -289,25 +339,21 @@ public class WakaTime implements ApplicationComponent {
                 }
 
                 heartbeatsQueue.add(h);
+                logTrackedActivityHeartbeat("queue", h.category, project, file, force, lineStats);
 
-                if (WakaTime.isBuilding) setBuildTimeout();
+                if (h.category != null) ensureActivityHeartbeat();
             }
         });
     }
 
-    private static void setBuildTimeout() {
-        AppExecutorUtil.getAppScheduledExecutorService().schedule(new Runnable() {
+    private static synchronized void ensureActivityHeartbeat() {
+        if (scheduledActivityHeartbeat != null && !scheduledActivityHeartbeat.isDone()) return;
+        scheduledActivityHeartbeat = AppExecutorUtil.getAppScheduledExecutorService().schedule(new Runnable() {
             @Override
             public void run() {
-                if (!WakaTime.isBuilding) return;
-                Project project = getCurrentProject();
-                if (project == null) return;
-                if (!WakaTime.isProjectInitialized(project)) return;
-                VirtualFile file = WakaTime.getCurrentFile(project);
-                if (file == null) return;
-                Document document = WakaTime.getCurrentDocument(project);
-                LineStats lineStats = WakaTime.getLineStats(file);
-                WakaTime.appendHeartbeat(file, project, false, lineStats);
+                scheduledActivityHeartbeat = null;
+                if (WakaTime.getCurrentActivityCategory() == null) return;
+                WakaTime.appendActivityHeartbeat(WakaTime.getCurrentActivityProject(), true);
             }
         }, 10, TimeUnit.SECONDS);
     }
@@ -414,8 +460,10 @@ public class WakaTime implements ApplicationComponent {
             if (heartbeat.isUnsavedFile) {
                 h.append(",\"is_unsaved_entity\":true");
             }
-            if (heartbeat.isBuilding) {
-                h.append(",\"category\":\"building\"");
+            if (heartbeat.category != null) {
+                h.append(",\"category\":\"");
+                h.append(jsonEscape(heartbeat.category));
+                h.append("\"");
             }
             if (heartbeat.project != null) {
                 h.append(",\"alternate_project\":\"");
@@ -524,9 +572,9 @@ public class WakaTime implements ApplicationComponent {
             cmds.add("--write");
         if (heartbeat.isUnsavedFile)
             cmds.add("--is-unsaved-entity");
-        if (heartbeat.isBuilding) {
+        if (heartbeat.category != null) {
             cmds.add("--category");
-            cmds.add("building");
+            cmds.add(heartbeat.category);
         }
         if (WakaTime.METRICS)
             cmds.add("--metrics");
@@ -609,6 +657,18 @@ public class WakaTime implements ApplicationComponent {
         WakaTime.DEBUG = debug != null && debug.trim().equals("true");
         String metrics = ConfigFile.get("settings", "metrics", false);
         WakaTime.METRICS = metrics != null && metrics.trim().equals("true");
+        String building = ConfigFile.getModSetting("building_enabled");
+        WakaTime.TRACK_BUILDING = building != null && building.trim().equals("true");
+        String aiCoding = ConfigFile.getModSetting("ai_coding_enabled");
+        WakaTime.TRACK_AI_CODING = aiCoding != null && aiCoding.trim().equals("true");
+        String debugging = ConfigFile.getModSetting("debugging_enabled");
+        WakaTime.TRACK_DEBUGGING = debugging != null && debugging.trim().equals("true");
+        String runningTests = ConfigFile.getModSetting("running_tests_enabled");
+        WakaTime.TRACK_RUNNING_TESTS = runningTests != null && runningTests.trim().equals("true");
+        if (!WakaTime.TRACK_BUILDING) clearActivityCategory(CATEGORY_BUILDING);
+        if (!WakaTime.TRACK_AI_CODING) clearActivityCategory(CATEGORY_AI_CODING);
+        if (!WakaTime.TRACK_DEBUGGING) clearActivityCategory(CATEGORY_DEBUGGING);
+        if (!WakaTime.TRACK_RUNNING_TESTS) clearActivityCategory(CATEGORY_RUNNING_TESTS);
     }
 
     public static void setupStatusBar() {
@@ -668,6 +728,18 @@ public class WakaTime implements ApplicationComponent {
         return WakaTime.getFile(document);
     }
 
+    @Nullable
+    public static VirtualFile getCurrentOrLastFile(Project project) {
+        VirtualFile file = WakaTime.getCurrentFile(project);
+        if (file != null) {
+            return file;
+        }
+        if (WakaTime.lastFile == null) {
+            return null;
+        }
+        return LocalFileSystem.getInstance().findFileByPath(WakaTime.lastFile);
+    }
+
     public static Project getProject(Document document) {
         Editor[] editors = EditorFactory.getInstance().getEditors(document);
         if (editors.length > 0) {
@@ -686,11 +758,316 @@ public class WakaTime implements ApplicationComponent {
 
     @Nullable
     public static Project getCurrentProject() {
-        Project project = null;
         try {
-            project = ProjectManager.getInstance().getDefaultProject();
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (project != null && project.isInitialized() && WakaTime.getCurrentFile(project) != null) {
+                    return project;
+                }
+            }
+            Project[] openProjects = ProjectManager.getInstance().getOpenProjects();
+            if (openProjects.length > 0) {
+                return openProjects[0];
+            }
         } catch (Exception e) { }
+        return null;
+    }
+
+    public static void subscribeProjectListeners(@Nullable Project project) {
+        if (project == null || project.isDisposed()) return;
+        String locationHash = project.getLocationHash();
+        if (locationHash != null && projectTaskSubscriptions.putIfAbsent(locationHash, true) != null) return;
+        project.getMessageBus().connect(project).subscribe(ProjectTaskListener.TOPIC, new CustomProjectTaskListener(project));
+    }
+
+    public static void forgetProjectListeners(@Nullable Project project) {
+        if (project == null) return;
+        String locationHash = project.getLocationHash();
+        if (locationHash != null) {
+            projectTaskSubscriptions.remove(locationHash);
+        }
+    }
+
+    public static void appendActivityHeartbeat(@Nullable Project preferredProject, boolean force) {
+        String category = WakaTime.getCurrentActivityCategory();
+        if (category == null) return;
+        Application app = ApplicationManager.getApplication();
+        if (app == null) return;
+        ActivityHeartbeatData data;
+        if (app.isDispatchThread()) {
+            data = app.runReadAction(new Computable<ActivityHeartbeatData>() {
+                @Override
+                public ActivityHeartbeatData compute() {
+                    return collectActivityHeartbeatDataOnEdt(preferredProject);
+                }
+            });
+        } else {
+            data = app.runReadAction(new Computable<ActivityHeartbeatData>() {
+                @Override
+                public ActivityHeartbeatData compute() {
+                    return collectActivityHeartbeatDataOffEdt(preferredProject);
+                }
+            });
+        }
+        if (data == null) {
+            logTrackedActivityEvent("heartbeat-skip", null, category, preferredProject, "reason=no-activity-file");
+            return;
+        }
+        logTrackedActivityHeartbeat("heartbeat-queue", category, data.project, data.file, force, data.lineStats);
+        WakaTime.appendHeartbeat(data.file, data.project, false, data.lineStats, force);
+    }
+
+    @Nullable
+    private static ActivityHeartbeatData collectActivityHeartbeatDataOnEdt(@Nullable Project preferredProject) {
+        Project project = getPreferredActivityProject(preferredProject, true);
+        if (project == null || !WakaTime.isProjectInitialized(project)) return null;
+        VirtualFile file = WakaTime.getCurrentOrLastFile(project);
+        if (file == null) return null;
+        return new ActivityHeartbeatData(file, project, WakaTime.getLineStats(file));
+    }
+
+    @Nullable
+    private static ActivityHeartbeatData collectActivityHeartbeatDataOffEdt(@Nullable Project preferredProject) {
+        Project project = getPreferredActivityProject(preferredProject, false);
+        if (project == null || !WakaTime.isProjectInitialized(project)) return null;
+        VirtualFile file = getLastTrackedFile();
+        if (file == null) return null;
+        return new ActivityHeartbeatData(file, project, getCachedLineStats(file));
+    }
+
+    @Nullable
+    private static Project getPreferredActivityProject(@Nullable Project preferredProject, boolean allowCurrentProjectLookup) {
+        Project project = preferredProject;
+        if (project == null || project.isDisposed()) {
+            project = WakaTime.getCurrentActivityProject();
+        }
+        if ((project == null || project.isDisposed()) && allowCurrentProjectLookup) {
+            project = WakaTime.getCurrentProject();
+        }
+        if (project == null || project.isDisposed()) {
+            Project[] openProjects = ProjectManager.getInstance().getOpenProjects();
+            if (openProjects.length > 0) {
+                project = openProjects[0];
+            }
+        }
         return project;
+    }
+
+    @Nullable
+    private static VirtualFile getLastTrackedFile() {
+        if (WakaTime.lastFile == null) return null;
+        return LocalFileSystem.getInstance().findFileByPath(WakaTime.lastFile);
+    }
+
+    @Nullable
+    private static LineStats getCachedLineStats(@Nullable VirtualFile file) {
+        if (file == null) return null;
+        LineStats cached = WakaTime.lineStatsCache.get(file.getPath());
+        if (cached == null) return null;
+        LineStats copy = new LineStats();
+        copy.lineCount = cached.lineCount;
+        copy.lineNumber = cached.lineNumber;
+        copy.cursorPosition = cached.cursorPosition;
+        copy.updatedAt = cached.updatedAt;
+        return copy;
+    }
+
+    public static synchronized void startActivity(String activityKey, String category, @Nullable Project project) {
+        if (!isTrackingEnabled(category)) {
+            logTrackedActivityEvent("start-skip", activityKey, category, project, "reason=disabled");
+            return;
+        }
+        String previousCategory = getCurrentActivityCategory();
+        activeActivityCategories.put(activityKey, category);
+        if (project != null) {
+            activeActivityProjects.put(activityKey, project);
+        }
+        String currentCategory = getCurrentActivityCategory();
+        logTrackedActivityEvent("start", activityKey, category, project, "previous=" + safeValue(previousCategory) + " current=" + safeValue(currentCategory));
+        if (currentCategory != null && !currentCategory.equals(previousCategory)) {
+            appendActivityHeartbeat(project, true);
+        }
+    }
+
+    public static synchronized void startTimedActivity(String activityKey, String category, @Nullable Project project, int timeoutSeconds) {
+        if (!isTrackingEnabled(category)) return;
+        startActivity(activityKey, category, project);
+        scheduleActivityStop(activityKey, timeoutSeconds);
+    }
+
+    public static synchronized void stopActivity(String activityKey) {
+        String previousCategory = getCurrentActivityCategory();
+        String removedCategory = activeActivityCategories.remove(activityKey);
+        activeActivityProjects.remove(activityKey);
+        cancelScheduledActivityStop(activityKey);
+        String currentCategory = getCurrentActivityCategory();
+        logTrackedActivityEvent("stop", activityKey, removedCategory, null, "previous=" + safeValue(previousCategory) + " current=" + safeValue(currentCategory));
+        if (currentCategory != null && !currentCategory.equals(previousCategory)) {
+            appendActivityHeartbeat(getCurrentActivityProject(), true);
+        }
+    }
+
+    public static synchronized void stopActivitiesByPrefix(String activityKeyPrefix) {
+        String previousCategory = getCurrentActivityCategory();
+        int removedCount = 0;
+        for (String key : new ArrayList<String>(activeActivityCategories.keySet())) {
+            if (key.startsWith(activityKeyPrefix)) {
+                activeActivityCategories.remove(key);
+                activeActivityProjects.remove(key);
+                cancelScheduledActivityStop(key);
+                removedCount++;
+            }
+        }
+        String currentCategory = getCurrentActivityCategory();
+        if (removedCount > 0) {
+            logTrackedActivityEvent("stop-prefix", activityKeyPrefix, previousCategory, null, "removed=" + removedCount + " current=" + safeValue(currentCategory));
+        }
+        if (currentCategory != null && !currentCategory.equals(previousCategory)) {
+            appendActivityHeartbeat(getCurrentActivityProject(), true);
+        }
+    }
+
+    public static synchronized void clearActivityCategory(String category) {
+        String previousCategory = getCurrentActivityCategory();
+        for (Map.Entry<String, String> entry : new ArrayList<Map.Entry<String, String>>(activeActivityCategories.entrySet())) {
+            if (category.equals(entry.getValue())) {
+                activeActivityCategories.remove(entry.getKey());
+                activeActivityProjects.remove(entry.getKey());
+                cancelScheduledActivityStop(entry.getKey());
+            }
+        }
+        String currentCategory = getCurrentActivityCategory();
+        if (currentCategory != null && !currentCategory.equals(previousCategory)) {
+            appendActivityHeartbeat(getCurrentActivityProject(), true);
+        }
+    }
+
+    @Nullable
+    public static String getCurrentActivityCategory() {
+        String currentCategory = null;
+        int currentPriority = Integer.MAX_VALUE;
+        for (String category : activeActivityCategories.values()) {
+            int priority = getActivityPriority(category);
+            if (priority < currentPriority) {
+                currentPriority = priority;
+                currentCategory = category;
+            }
+        }
+        return currentCategory;
+    }
+
+    @Nullable
+    public static Project getCurrentActivityProject() {
+        String selectedKey = null;
+        int currentPriority = Integer.MAX_VALUE;
+        for (Map.Entry<String, String> entry : activeActivityCategories.entrySet()) {
+            int priority = getActivityPriority(entry.getValue());
+            if (priority < currentPriority) {
+                currentPriority = priority;
+                selectedKey = entry.getKey();
+            }
+        }
+        if (selectedKey == null) return null;
+        Project project = activeActivityProjects.get(selectedKey);
+        if (project != null && !project.isDisposed()) {
+            return project;
+        }
+        return null;
+    }
+
+    @Nullable
+    public static String getExecutionCategory(@NotNull String executorId, @NotNull ExecutionEnvironment environment) {
+        if (WakaTime.TRACK_DEBUGGING && DefaultDebugExecutor.EXECUTOR_ID.equals(executorId)) {
+            return CATEGORY_DEBUGGING;
+        }
+        if (WakaTime.TRACK_RUNNING_TESTS && isTestExecution(environment)) {
+            return CATEGORY_RUNNING_TESTS;
+        }
+        return null;
+    }
+
+    private static boolean isTestExecution(@NotNull ExecutionEnvironment environment) {
+        RunProfile runProfile = environment.getRunProfile();
+        if (!(runProfile instanceof ConsolePropertiesProvider)) {
+            return false;
+        }
+        try {
+            TestConsoleProperties properties = ((ConsolePropertiesProvider) runProfile).createTestConsoleProperties(environment.getExecutor());
+            return properties != null;
+        } catch (Exception e) {
+            debugException(e);
+            return false;
+        }
+    }
+
+    private static boolean isTrackingEnabled(String category) {
+        if (CATEGORY_BUILDING.equals(category)) return WakaTime.TRACK_BUILDING;
+        if (CATEGORY_AI_CODING.equals(category)) return WakaTime.TRACK_AI_CODING;
+        if (CATEGORY_DEBUGGING.equals(category)) return WakaTime.TRACK_DEBUGGING;
+        if (CATEGORY_RUNNING_TESTS.equals(category)) return WakaTime.TRACK_RUNNING_TESTS;
+        return false;
+    }
+
+    private static int getActivityPriority(String category) {
+        if (CATEGORY_AI_CODING.equals(category)) return 0;
+        if (CATEGORY_DEBUGGING.equals(category)) return 1;
+        if (CATEGORY_RUNNING_TESTS.equals(category)) return 2;
+        if (CATEGORY_BUILDING.equals(category)) return 3;
+        return Integer.MAX_VALUE;
+    }
+
+    private static void scheduleActivityStop(final String activityKey, int timeoutSeconds) {
+        cancelScheduledActivityStop(activityKey);
+        ScheduledFuture<?> future = AppExecutorUtil.getAppScheduledExecutorService().schedule(new Runnable() {
+            @Override
+            public void run() {
+                scheduledActivityStops.remove(activityKey);
+                stopActivity(activityKey);
+            }
+        }, timeoutSeconds, TimeUnit.SECONDS);
+        scheduledActivityStops.put(activityKey, future);
+    }
+
+    private static void cancelScheduledActivityStop(String activityKey) {
+        ScheduledFuture<?> future = scheduledActivityStops.remove(activityKey);
+        if (future != null) {
+            future.cancel(false);
+        }
+    }
+
+    public static boolean shouldTrackLikelyAiEdit(@NotNull VirtualFile file, @NotNull com.intellij.openapi.editor.event.DocumentEvent event) {
+        if (!WakaTime.TRACK_AI_CODING) return false;
+        if (WakaTime.hadRecentHumanTyping(file, AI_HUMAN_TYPING_GRACE_PERIOD_MILLIS)) return false;
+        if (event.isWholeTextReplaced()) return true;
+
+        int changedChars = Math.max(event.getNewLength(), event.getOldLength());
+        if (changedChars >= AI_MIN_CHANGED_CHARS) return true;
+
+        CharSequence newFragment = event.getNewFragment();
+        return newFragment.length() >= AI_MIN_INSERTED_CHARS && countLines(newFragment) >= AI_MIN_INSERTED_LINES;
+    }
+
+    public static void markFileWithLikelyAiEdit(@NotNull VirtualFile file, @Nullable Project project) {
+        WakaTime.startTimedActivity(AI_ACTIVITY_PREFIX + file.getPath(), CATEGORY_AI_CODING, project, AI_ACTIVITY_TIMEOUT_SECONDS);
+    }
+
+    public static void stopLikelyAiEdit(@NotNull VirtualFile file) {
+        WakaTime.stopActivity(AI_ACTIVITY_PREFIX + file.getPath());
+    }
+
+    public static synchronized boolean hadRecentHumanTyping(@NotNull VirtualFile file, long withinMillis) {
+        Long lastTypedAt = WakaTime.lastHumanTypingAt.get(file.getPath());
+        return lastTypedAt != null && (System.currentTimeMillis() - lastTypedAt) < withinMillis;
+    }
+
+    private static int countLines(@NotNull CharSequence text) {
+        if (text.length() == 0) return 0;
+        int lines = 1;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') {
+                lines++;
+            }
+        }
+        return lines;
     }
 
     public static LineStats getLineStats(@Nullable Document document, @Nullable Editor editor) {
@@ -725,15 +1102,16 @@ public class WakaTime implements ApplicationComponent {
 
     public static LineStats getLineStats(@Nullable Document document) {
         if (document != null) {
+            VirtualFile file = WakaTime.getFile(document);
             LineStats lineStats = new LineStats();
             lineStats.lineCount = document.getLineCount();
-            Caret caret = CommonDataKeys.CARET.getData(DataManager.getInstance().getDataContext());
+            Caret caret = getCurrentCaretIfAvailable();
             if (caret != null) {
                 LogicalPosition position = caret.getLogicalPosition();
                 lineStats.lineNumber = position.line + 1;
                 lineStats.cursorPosition = position.column + 1;
             }
-            saveLineStats(document, lineStats, true);
+            saveLineStats(file, lineStats, true);
             return lineStats;
         }
 
@@ -741,7 +1119,7 @@ public class WakaTime implements ApplicationComponent {
     }
 
     public static LineStats getLineStats(@Nullable VirtualFile file) {
-        Caret caret = CommonDataKeys.CARET.getData(DataManager.getInstance().getDataContext());
+        Caret caret = getCurrentCaretIfAvailable();
         LineStats lineStats = new LineStats();
         if (file != null) {
             Document document = FileDocumentManager.getInstance().getDocument(file);
@@ -775,6 +1153,15 @@ public class WakaTime implements ApplicationComponent {
         return WakaTime.lineStatsCache.get(file.getPath());
     }
 
+    @Nullable
+    private static Caret getCurrentCaretIfAvailable() {
+        Application app = ApplicationManager.getApplication();
+        if (app == null || !app.isDispatchThread()) {
+            return null;
+        }
+        return CommonDataKeys.CARET.getData(DataManager.getInstance().getDataContext());
+    }
+
     public static void saveLineStats(Document document, LineStats lineStats) {
         VirtualFile file = WakaTime.getFile(document);
         saveLineStats(file, lineStats);
@@ -792,6 +1179,15 @@ public class WakaTime implements ApplicationComponent {
     public static synchronized void saveLineStats(@Nullable VirtualFile file, LineStats lineStats, boolean updateLineChanges) {
         if (file == null) return;
         if (lineStats == null || !lineStats.hasLineCount()) return;
+        LineStats previous = WakaTime.lineStatsCache.get(file.getPath());
+        if (previous != null) {
+            if (lineStats.lineNumber == null) {
+                lineStats.lineNumber = previous.lineNumber;
+            }
+            if (lineStats.cursorPosition == null) {
+                lineStats.cursorPosition = previous.cursorPosition;
+            }
+        }
         lineStats.updatedAt = System.currentTimeMillis();
         if (updateLineChanges) {
             updateLineChanges(file, lineStats);
@@ -829,6 +1225,7 @@ public class WakaTime implements ApplicationComponent {
 
     public static synchronized void markFileWithHumanTyping(@NotNull VirtualFile file) {
         WakaTime.filesWithHumanTyping.put(file.getPath(), true);
+        WakaTime.lastHumanTypingAt.put(file.getPath(), System.currentTimeMillis());
     }
 
     public static void openDashboardWebsite() {
@@ -918,6 +1315,59 @@ public class WakaTime implements ApplicationComponent {
             lastCmd = cmd;
         }
         return newCmds.toArray(new String[newCmds.size()]);
+    }
+
+    public static void logTrackedActivityEvent(@NotNull String event, @Nullable String activityKey, @Nullable String category, @Nullable Project project, @Nullable String details) {
+        if (!log.isDebugEnabled()) return;
+        if (!shouldLogTrackedActivity(category)) return;
+        StringBuilder message = new StringBuilder("tracked-activity ");
+        message.append(event);
+        message.append(" category=").append(safeValue(category));
+        if (activityKey != null) {
+            message.append(" key=").append(activityKey);
+        }
+        if (project != null && !project.isDisposed()) {
+            message.append(" project=").append(project.getName());
+        }
+        if (details != null && !details.trim().isEmpty()) {
+            message.append(" ").append(details);
+        }
+        log.debug(message.toString());
+    }
+
+    private static void logTrackedActivityHeartbeat(@NotNull String event, @Nullable String category, @Nullable Project project, @Nullable VirtualFile file, boolean force, @Nullable LineStats lineStats) {
+        if (!log.isDebugEnabled()) return;
+        if (!shouldLogTrackedActivity(category)) return;
+        StringBuilder message = new StringBuilder("tracked-activity ");
+        message.append(event);
+        message.append(" category=").append(safeValue(category));
+        if (project != null && !project.isDisposed()) {
+            message.append(" project=").append(project.getName());
+        }
+        if (file != null) {
+            message.append(" file=").append(file.getPath());
+        }
+        message.append(" force=").append(force);
+        if (lineStats != null) {
+            if (lineStats.lineNumber != null) {
+                message.append(" line=").append(lineStats.lineNumber);
+            }
+            if (lineStats.cursorPosition != null) {
+                message.append(" cursor=").append(lineStats.cursorPosition);
+            }
+        }
+        log.debug(message.toString());
+    }
+
+    private static boolean shouldLogTrackedActivity(@Nullable String category) {
+        return CATEGORY_BUILDING.equals(category) ||
+               CATEGORY_DEBUGGING.equals(category) ||
+               CATEGORY_RUNNING_TESTS.equals(category);
+    }
+
+    @NotNull
+    private static String safeValue(@Nullable String value) {
+        return value == null ? "<none>" : value;
     }
 
     public static void debugException(Exception e) {

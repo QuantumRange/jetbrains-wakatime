@@ -25,11 +25,14 @@ public class CustomDocumentListener implements BulkAwareDocumentListener.Simple 
             Document document = documentEvent.getDocument();
             VirtualFile file = WakaTime.getFile(document);
             if (file == null) return;
-            if (documentEvent.getNewFragment().length() == 1) {
-                WakaTime.markFileWithHumanTyping(file);
-            }
             Project project = WakaTime.getProject(document);
             if (!WakaTime.isProjectInitialized(project)) return;
+            if (documentEvent.getNewFragment().length() == 1) {
+                WakaTime.markFileWithHumanTyping(file);
+                WakaTime.stopLikelyAiEdit(file);
+            } else if (WakaTime.shouldTrackLikelyAiEdit(file, documentEvent)) {
+                WakaTime.markFileWithLikelyAiEdit(file, project);
+            }
             LineStats lineStats = WakaTime.getLineStats(document);
             WakaTime.appendHeartbeat(file, project, false, lineStats);
         } catch(Exception e) {

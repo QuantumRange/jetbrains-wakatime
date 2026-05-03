@@ -20,6 +20,7 @@ public class ConfigFile {
     private static final String fileName = ".wakatime.cfg";
     private static final String internalFileName = "wakatime-internal.cfg";
     private static final String defaultDashboardUrl = "https://wakatime.com/dashboard";
+    private static final String modSettingPrefix = "mod_";
     private static String cachedHomeFolder = null;
     private static String _api_key = "";
     private static String _dashboard_url = "";
@@ -160,6 +161,14 @@ public class ConfigFile {
             writer.print(contents.toString());
             writer.close();
         }
+    }
+
+    public static String getModSetting(String key) {
+        return get("settings", modSettingPrefix + key, false);
+    }
+
+    public static void setModSetting(String key, String val) {
+        set("settings", modSettingPrefix + key, false, val);
     }
 
     public static String getApiKey() {

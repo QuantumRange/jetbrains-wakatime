@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.wakatime"
-version = "16.1.2"
+version = "16.1.2-p1"
 
 repositories {
     mavenCentral()
@@ -21,23 +21,8 @@ dependencies {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
-}
-
-sourceSets["main"].apply {
-    java.setSrcDirs(listOf("src"))
-    resources.setSrcDirs(emptyList<Any>())
-}
-
-tasks.processResources {
-    from("src") {
-        include("**/*.svg", "**/*.png")
-    }
-    from(".") {
-        include("META-INF/**")
-        exclude("META-INF/MANIFEST.MF")
-    }
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 intellijPlatform {

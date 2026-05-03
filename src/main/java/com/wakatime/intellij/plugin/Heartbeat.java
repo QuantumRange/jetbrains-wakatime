@@ -22,5 +22,5 @@ public class Heartbeat {
     public Boolean isUnsavedFile;
     public String project;
     public String language;
-    public Boolean isBuilding;
+    public String category;
 }

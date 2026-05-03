@@ -27,6 +27,14 @@ public class Settings extends DialogWrapper {
     private final JCheckBox debug;
     private final JLabel statusBarLabel;
     private final JCheckBox statusBar;
+    private final JLabel buildingLabel;
+    private final JCheckBox building;
+    private final JLabel aiCodingLabel;
+    private final JCheckBox aiCoding;
+    private final JLabel debuggingLabel;
+    private final JCheckBox debugging;
+    private final JLabel runningTestsLabel;
+    private final JCheckBox runningTests;
 
     public Settings(@Nullable Project project) {
         super(project, true);
@@ -63,6 +71,34 @@ public class Settings extends DialogWrapper {
         debug.setSelected(debugValue != null && debugValue.trim().toLowerCase().equals("true"));
         panel.add(debug);
 
+        buildingLabel = new JLabel("Track time spent building:", JLabel.CENTER);
+        panel.add(buildingLabel);
+        String buildingValue = ConfigFile.getModSetting("building_enabled");
+        building = new JCheckBox();
+        building.setSelected(buildingValue != null && buildingValue.trim().toLowerCase().equals("true"));
+        panel.add(building);
+
+        aiCodingLabel = new JLabel("Track time spent AI coding (heuristic):", JLabel.CENTER);
+        panel.add(aiCodingLabel);
+        String aiCodingValue = ConfigFile.getModSetting("ai_coding_enabled");
+        aiCoding = new JCheckBox();
+        aiCoding.setSelected(aiCodingValue != null && aiCodingValue.trim().toLowerCase().equals("true"));
+        panel.add(aiCoding);
+
+        debuggingLabel = new JLabel("Track time spent debugging:", JLabel.CENTER);
+        panel.add(debuggingLabel);
+        String debuggingValue = ConfigFile.getModSetting("debugging_enabled");
+        debugging = new JCheckBox();
+        debugging.setSelected(debuggingValue != null && debuggingValue.trim().toLowerCase().equals("true"));
+        panel.add(debugging);
+
+        runningTestsLabel = new JLabel("Track time spent running tests:", JLabel.CENTER);
+        panel.add(runningTestsLabel);
+        String runningTestsValue = ConfigFile.getModSetting("running_tests_enabled");
+        runningTests = new JCheckBox();
+        runningTests.setSelected(runningTestsValue != null && runningTestsValue.trim().toLowerCase().equals("true"));
+        panel.add(runningTests);
+
         init();
     }
 
@@ -88,6 +124,10 @@ public class Settings extends DialogWrapper {
         ConfigFile.set("settings", "proxy", false, proxy.getText());
         ConfigFile.set("settings", "debug", false, debug.isSelected() ? "true" : "false");
         ConfigFile.set("settings", "status_bar_enabled", false, statusBar.isSelected() ? "true" : "false");
+        ConfigFile.setModSetting("building_enabled", building.isSelected() ? "true" : "false");
+        ConfigFile.setModSetting("ai_coding_enabled", aiCoding.isSelected() ? "true" : "false");
+        ConfigFile.setModSetting("debugging_enabled", debugging.isSelected() ? "true" : "false");
+        ConfigFile.setModSetting("running_tests_enabled", runningTests.isSelected() ? "true" : "false");
         WakaTime.setupConfigs();
         WakaTime.setupStatusBar();
         WakaTime.setLoggingLevel();

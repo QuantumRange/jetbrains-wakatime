@@ -19,38 +19,41 @@ import java.awt.EventQueue;
 import java.util.UUID;
 
 public class CustomBuildManagerListener implements BuildManagerListener, CompilationStatusListener {
+    private static final String BUILD_MANAGER_ACTIVITY_PREFIX = "build-manager:";
+
     @Override
     public void buildStarted(@NotNull Project project, @NotNull UUID sessionId, boolean isAutomake) {
-        // WakaTime.log.debug("buildStarted event");
+        if (!WakaTime.TRACK_BUILDING) return;
         if (!WakaTime.isAppActive()) return;
         if (!WakaTime.isProjectInitialized(project)) return;
+        WakaTime.logTrackedActivityEvent("build-manager-start", BUILD_MANAGER_ACTIVITY_PREFIX + sessionId, WakaTime.CATEGORY_BUILDING, project, "sessionId=" + sessionId + " automake=" + isAutomake);
         EventQueue.invokeLater(new Runnable() {
             @Override
             public void run() {
-                VirtualFile file = WakaTime.getCurrentFile(project);
+                VirtualFile file = WakaTime.getCurrentOrLastFile(project);
                 if (file == null) return;
-                WakaTime.isBuilding = true;
-                LineStats lineStats = WakaTime.getLineStats(file);
-                WakaTime.appendHeartbeat(file, project, false, lineStats);
+                WakaTime.startActivity(BUILD_MANAGER_ACTIVITY_PREFIX + sessionId, WakaTime.CATEGORY_BUILDING, project);
             }
         });
     }
 
     @Override
     public void buildFinished(@NotNull Project project, @NotNull UUID sessionId, boolean isAutomake)  {
-        // WakaTime.log.debug("buildFinished event");
-        WakaTime.isBuilding = false;
+        WakaTime.logTrackedActivityEvent("build-manager-stop", BUILD_MANAGER_ACTIVITY_PREFIX + sessionId, WakaTime.CATEGORY_BUILDING, project, "sessionId=" + sessionId + " automake=" + isAutomake);
+        WakaTime.stopActivity(BUILD_MANAGER_ACTIVITY_PREFIX + sessionId);
     }
 
     @Override
     public void compilationFinished(boolean aborted, int errors, int warnings, @NotNull CompileContext compileContext) {
-        // WakaTime.log.debug("compilationFinished event");
-        WakaTime.isBuilding = false;
+        Project project = compileContext.getProject();
+        WakaTime.logTrackedActivityEvent("compile-finished", BUILD_MANAGER_ACTIVITY_PREFIX, WakaTime.CATEGORY_BUILDING, project, "aborted=" + aborted + " errors=" + errors + " warnings=" + warnings);
+        WakaTime.stopActivitiesByPrefix(BUILD_MANAGER_ACTIVITY_PREFIX);
     }
 
     @Override
     public void automakeCompilationFinished(int errors, int warnings, @NotNull CompileContext compileContext) {
-        // WakaTime.log.debug("automakeCompilationFinished event");
-        WakaTime.isBuilding = false;
+        Project project = compileContext.getProject();
+        WakaTime.logTrackedActivityEvent("automake-finished", BUILD_MANAGER_ACTIVITY_PREFIX, WakaTime.CATEGORY_BUILDING, project, "errors=" + errors + " warnings=" + warnings);
+        WakaTime.stopActivitiesByPrefix(BUILD_MANAGER_ACTIVITY_PREFIX);
     }
 }

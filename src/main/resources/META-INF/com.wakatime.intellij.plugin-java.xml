@@ -1,0 +1,10 @@
+<idea-plugin>
+    <applicationListeners>
+        <listener class="com.wakatime.intellij.plugin.CustomBuildManagerListener"
+                  topic="com.intellij.compiler.server.BuildManagerListener"/>
+    </applicationListeners>
+    <projectListeners>
+        <listener class="com.wakatime.intellij.plugin.CustomBuildManagerListener"
+                  topic="com.intellij.openapi.compiler.CompilationStatusListener"/>
+    </projectListeners>
+</idea-plugin>
