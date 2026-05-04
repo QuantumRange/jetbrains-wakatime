@@ -56,6 +56,8 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.*;
 
@@ -776,7 +778,13 @@ public class WakaTime implements ApplicationComponent {
         if (project == null || project.isDisposed()) return;
         String locationHash = project.getLocationHash();
         if (locationHash != null && projectTaskSubscriptions.putIfAbsent(locationHash, true) != null) return;
-        project.getMessageBus().connect(project).subscribe(ProjectTaskListener.TOPIC, new CustomProjectTaskListener(project));
+        com.intellij.util.messages.MessageBusConnection conn = project.getMessageBus().connect(project);
+        conn.subscribe(ProjectTaskListener.TOPIC, new CustomProjectTaskListener(project));
+        try {
+            conn.subscribe(com.intellij.openapi.wm.ex.ToolWindowManagerListener.TOPIC, new CustomToolWindowListener(project));
+        } catch (Throwable t) {
+            debugException(t instanceof Exception ? (Exception) t : new RuntimeException(t));
+        }
     }
 
     public static void forgetProjectListeners(@Nullable Project project) {
@@ -982,6 +990,9 @@ public class WakaTime implements ApplicationComponent {
         if (WakaTime.TRACK_RUNNING_TESTS && isTestExecution(environment)) {
             return CATEGORY_RUNNING_TESTS;
         }
+        if (WakaTime.TRACK_BUILDING && isCargoBuildExecution(environment)) {
+            return CATEGORY_BUILDING;
+        }
         return null;
     }
 
@@ -995,6 +1006,45 @@ public class WakaTime implements ApplicationComponent {
             return properties != null;
         } catch (Exception e) {
             debugException(e);
+            return false;
+        }
+    }
+
+    private static final HashSet<String> CARGO_BUILD_COMMANDS = new HashSet<String>(Arrays.asList(
+        "build", "check", "clippy", "doc", "rustc"
+    ));
+
+    // Detects RustRover/IntelliJ-Rust cargo build-style executions via reflection
+    // so the plugin keeps loading on IDEs without the Rust module.
+    private static boolean isCargoBuildExecution(@NotNull ExecutionEnvironment environment) {
+        RunProfile runProfile = environment.getRunProfile();
+        if (runProfile == null) return false;
+        try {
+            Class<?> clazz = runProfile.getClass();
+            boolean isCargo = false;
+            while (clazz != null) {
+                String name = clazz.getName();
+                if ("org.rust.cargo.runconfig.command.CargoCommandConfiguration".equals(name)) {
+                    isCargo = true;
+                    break;
+                }
+                clazz = clazz.getSuperclass();
+            }
+            if (!isCargo) return false;
+            Object commandValue = null;
+            try {
+                java.lang.reflect.Method getter = runProfile.getClass().getMethod("getCommand");
+                commandValue = getter.invoke(runProfile);
+            } catch (NoSuchMethodException ignored) {
+                java.lang.reflect.Field field = runProfile.getClass().getField("command");
+                commandValue = field.get(runProfile);
+            }
+            if (!(commandValue instanceof String)) return false;
+            String command = ((String) commandValue).trim().toLowerCase(Locale.ROOT);
+            if (command.isEmpty()) return false;
+            String head = command.split("\\s+", 2)[0];
+            return CARGO_BUILD_COMMANDS.contains(head);
+        } catch (Throwable t) {
             return false;
         }
     }

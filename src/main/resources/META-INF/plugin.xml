@@ -1,7 +1,7 @@
 <idea-plugin version="2" url="https://wakatime.com" require-restart="true">
     <id>com.wakatime.intellij.plugin</id>
     <name>WakaTime</name>
-    <version>16.1.2-p1</version>
+    <version>16.1.2-p2</version>
     <vendor email="support@wakatime.com" url="https://wakatime.com">WakaTime</vendor>
 
     <description><![CDATA[
@@ -27,6 +27,12 @@
     ]]></description>
 
     <change-notes><![CDATA[
+16.1.2-p2 (2026-05-04)<br />
+++++++++++++++++++<br />
+<br />
+- Detect cargo build/check/clippy/doc executions in RustRover for the building tracker.<br />
+<br />
+<br />
 16.1.2-p1 (2026-05-03)<br />
 ++++++++++++++++++<br />
 <br />

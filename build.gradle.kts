@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.wakatime"
-version = "16.1.2-p1"
+version = "16.1.2-p2"
 
 repositories {
     mavenCentral()
