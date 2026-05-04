@@ -778,13 +778,7 @@ public class WakaTime implements ApplicationComponent {
         if (project == null || project.isDisposed()) return;
         String locationHash = project.getLocationHash();
         if (locationHash != null && projectTaskSubscriptions.putIfAbsent(locationHash, true) != null) return;
-        com.intellij.util.messages.MessageBusConnection conn = project.getMessageBus().connect(project);
-        conn.subscribe(ProjectTaskListener.TOPIC, new CustomProjectTaskListener(project));
-        try {
-            conn.subscribe(com.intellij.openapi.wm.ex.ToolWindowManagerListener.TOPIC, new CustomToolWindowListener(project));
-        } catch (Throwable t) {
-            debugException(t instanceof Exception ? (Exception) t : new RuntimeException(t));
-        }
+        project.getMessageBus().connect(project).subscribe(ProjectTaskListener.TOPIC, new CustomProjectTaskListener(project));
     }
 
     public static void forgetProjectListeners(@Nullable Project project) {
